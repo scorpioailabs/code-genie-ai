@@ -1,0 +1,8 @@
+.env
+/repo
+.DS_Store
+/venv
+.pyvenv.config
+/Lib
+/Include
+__pycache__
