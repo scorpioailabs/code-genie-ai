@@ -1,12 +1,12 @@
 create extension if not exists vector with schema public;
-create table repo_chat (
+create table code_genie (
        id bigserial primary key,
        content text, -- corresponds to Document.pageContent
        metadata jsonb, -- corresponds to Document.metadata
        embedding vector(1536) -- 1536 works for OpenAI embeddings, change if needed
        );
 
-       CREATE FUNCTION repo_chat_search(query_embedding vector(1536), match_count int)
+       CREATE FUNCTION code_genie_search(query_embedding vector(1536), match_count int)
            RETURNS TABLE(
                id bigint,
                content text,
