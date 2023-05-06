@@ -1,7 +1,8 @@
 # Code Genie AI
 
 Code Genie AI is an automated tool that optimizes, refactors, and improves the readability of code. It solves boring refactoring jobs and helps developers work more efficiently.
-We've forked McKay's repository repo-chatTo get started, check it out[link](https://github.com/mckaywrigley/repo-chat) to create this awesome forkage :D, full credit to him for the original work. We've added a few features to make it more useful for our use case.
+We've forked McKay's repository repo-chat, (check it out[link](https://github.com/mckaywrigley/repo-chat)).
+We've re-designed it and added features on top to make it more useful for our use case.
 
 ## Requirements
 
