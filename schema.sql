@@ -24,11 +24,11 @@ create table code_genie (
                content,
                metadata,
                embedding,
-               1 -(repo_chat.embedding <=> query_embedding) AS similarity
+               1 -(code_genie.embedding <=> query_embedding) AS similarity
            FROM
-               repo_chat
+               code_genie
            ORDER BY
-               repo_chat.embedding <=> query_embedding
+               code_genie.embedding <=> query_embedding
            LIMIT match_count;
        END;
        $$;
