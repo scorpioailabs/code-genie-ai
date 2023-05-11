@@ -40,10 +40,4 @@ embed_codebase()
 # Define the prompt template for CodeGenie AI
 
 # Call the analyze_and_suggest_improvements function to get suggestions
-suggestions = analyze_and_suggest_improvements()
-for suggestion in suggestions:
-    print(f"{suggestion['file']}:\n{suggestion['suggestion']}\n")
-
-
-# Log the number of suggestions generated
-print(f"Generated {len(suggestions)} suggestions in total.")
+analyze_and_suggest_improvements()
