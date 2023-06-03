@@ -5,6 +5,7 @@ from langchain.embeddings.openai import OpenAIEmbeddings
 from langchain.text_splitter import CharacterTextSplitter
 from langchain.vectorstores import SupabaseVectorStore
 from langchain.document_loaders import TextLoader
+from loader import TextLoader
 
 load_dotenv()
 
@@ -27,9 +28,15 @@ def embed_codebase():
         print(e)
         already_embedded_files = []
 
+    # Get the local path of the repository
+    local_path = os.environ.get("LOCAL_PATH")
+
+    # Get the URL of the repository
+    repo_url = os.environ.get("REPO_URL")
+
     # Check if there are any new files to embed
     new_files = []
-    for dirpath, dirnames, filenames in os.walk('repo'):
+    for dirpath, dirnames, filenames in os.walk(local_path):
         # Skip directories in exclude_dir
         dirnames[:] = [d for d in dirnames if d not in exclude_dir]
 
@@ -47,7 +54,13 @@ def embed_codebase():
     # Load and split the documents
     documents = []
     for file_path in new_files:
-        loader = TextLoader(file_path, encoding='ISO-8859-1')
+        # Create a relative file path
+        relative_file_path = os.path.relpath(file_path, local_path)
+
+        # Combine the repo URL and the relative file path to create a unique key
+        unique_file_key = f"{repo_url}/{relative_file_path}"
+
+        loader = TextLoader(unique_file_key, encoding='ISO-8859-1')
         documents.extend(loader.load())
 
     text_splitter = CharacterTextSplitter(chunk_size=2000, chunk_overlap=200)
@@ -79,3 +92,4 @@ def embed_codebase():
         )
 
         print(f"Stored batch {i + 1}/{num_batches}")
+

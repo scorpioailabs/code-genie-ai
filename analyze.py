@@ -303,8 +303,24 @@ def get_file_path_and_dictionary(suggestion):
     except ValueError as e:
         raise ValueError(f"Error parsing dictionary from suggestion: {e}")
 
-    file_path = dictionary['source']
-    return file_path, dictionary
+    file_key = dictionary['source']
+
+    # Split the file key at the last occurrence of '.git'
+    repo_url, relative_file_path = file_key.rsplit('.git', 1)
+
+    # Add the '.git' back to the repository URL
+    repo_url += '.git'
+
+    # If the relative file path starts with a '/', remove it
+    if relative_file_path.startswith('/'):
+        relative_file_path = relative_file_path[1:]
+
+    return relative_file_path, dictionary
+
+    # Split the file key back into the repository URL and relative file path
+    repo_url, relative_file_path = file_key.split('/', 1)
+
+    return relative_file_path, dictionary
 
 def read_original_code(file_path):
     with open(file_path, 'r', encoding='utf-8') as f:
