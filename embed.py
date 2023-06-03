@@ -1,32 +1,21 @@
 import os
 from dotenv import load_dotenv
-from supabase.client import Client, create_client
 from langchain.embeddings.openai import OpenAIEmbeddings
 from langchain.text_splitter import CharacterTextSplitter
-from langchain.vectorstores import SupabaseVectorStore
+from langchain.vectorstores import ChromaVectorStore
 from langchain.document_loaders import TextLoader
-from loader import TextLoader
+from llama_index import GPTVectorStoreIndex
+from llama_index.storage.storage_context import StorageContext
+import chromadb
 
 load_dotenv()
 
-supabase_url = os.environ.get("SUPABASE_URL")
-supabase_key = os.environ.get("SUPABASE_SERVICE_KEY")
-supabase: Client = create_client(supabase_url, supabase_key)
 def embed_codebase():
     # Configure these to fit your needs
     exclude_dir = ['.git', 'node_modules', 'public', 'assets', 'Lib', 'site-packages', 'Scripts', 'env']
     exclude_files = ['package-lock.json', 'package.json', '.DS_Store']
     exclude_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.ico', '.svg', '.webp',
         '.mp3', '.wav', '.env', '.json', '.md']
-
-    # Get list of already embedded files
-    try:
-        response = supabase.table(os.environ.get("TABLE_NAME")).select('metadata').execute()
-        already_embedded_files = [doc['metadata']['source'] for doc in response.data]
-    except Exception as e:
-        # Log the error
-        print(e)
-        already_embedded_files = []
 
     # Get the local path of the repository
     local_path = os.environ.get("LOCAL_PATH")
@@ -43,8 +32,8 @@ def embed_codebase():
         for file in filenames:
             _, file_extension = os.path.splitext(file)
 
-            # Skip files in exclude_files or already embedded files
-            if file not in exclude_files and file_extension not in exclude_extensions and os.path.join(dirpath, file) not in already_embedded_files:
+            # Skip files in exclude_files or with exclude_extensions
+            if file not in exclude_files and file_extension not in exclude_extensions:
                 new_files.append(os.path.join(dirpath, file))
 
     if not new_files:
@@ -78,18 +67,28 @@ def embed_codebase():
     total_docs = len(docs)
     num_batches = total_docs // batch_size + int(total_docs % batch_size > 0)
 
+    # Create a Chroma index
+    chroma_client = chromadb.Client()
+    chroma_collection = chroma_client.create_collection("quickstart")
+
+    # Initialize ChromaVectorStore and StorageContext
+    vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
+    storage_context = StorageContext.from_defaults(vector_store=vector_store)
+
+    # Create the GPTVectorStoreIndex
+    index = GPTVectorStoreIndex.from_documents(documents, storage_context=storage_context)
+
     for i in range(num_batches):
         start_index = i * batch_size
         end_index = min((i + 1) * batch_size, total_docs)
+        print(f"Embedding documents {start_index + 1} to {end_index} of {total_docs}")
 
         batch_docs = docs[start_index:end_index]
+        vectors = embeddings.embed_documents(batch_docs)
 
-        vector_store = SupabaseVectorStore.from_documents(
-            batch_docs,
-            embeddings,
-            client=supabase,
-            table_name=os.environ.get("TABLE_NAME"),
-        )
+        for doc, vector in zip(batch_docs, vectors):
+            vector_store.store_vector(doc.metadata['source'], vector)
 
         print(f"Stored batch {i + 1}/{num_batches}")
 
+    print("Embedding complete!")

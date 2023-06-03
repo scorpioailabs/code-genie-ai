@@ -1,12 +1,10 @@
 import os
-import openai
 import re
 from loguru import logger
 from pyAn.analyzer import CallGraphVisitor
 from dotenv import load_dotenv
-from supabase import create_client
+from chroma_db import ChromaDB
 from langchain import LLMChain
-from langchain.chat_models import ChatOpenAI
 from langchain.prompts import ChatPromptTemplate, SystemMessagePromptTemplate
 from langchain.callbacks.base import CallbackManager
 from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
@@ -16,18 +14,30 @@ from datetime import datetime, timedelta
 import time
 import difflib
 from suggestion import Suggestion
-# from langchain.llms import OpenAI
-# from langchain import PromptTemplate
+from transformers import AutoTokenizer, AutoModelForCausalLM
+tokenizer = AutoTokenizer.from_pretrained("flax-community/gpt-neo-125M-code-clippy")
+model = AutoModelForCausalLM.from_pretrained("flax-community/gpt-neo-125M-code-clippy")
 
 # Load the environment variables
 load_dotenv()
 
-supabase_url = os.environ.get("SUPABASE_URL")
-supabase_key = os.environ.get("SUPABASE_SERVICE_KEY")
-openai.api_key = os.environ.get("OPENAI_API_KEY")
-supabase = create_client(supabase_url, supabase_key)
+chroma_db_path = os.environ.get("CHROMA_DB_PATH")
+chroma_db = ChromaDB(chroma_db_path)
 
-model = os.environ.get("MODEL")
+def fetch_chroma_db_ids(batch_size=100):
+    # Define an offset to paginate the results from ChromaDB
+    offset = 0
+    
+    # Fetch ids from ChromaDB
+    ids_result = chroma_db.vector_store.chroma_collection.list_ids(limit=batch_size, offset=offset)
+
+    # Process ids_result to obtain the ids list
+    id_list = [entry['id'] for entry in ids_result]
+
+    # Update the offset for the next batch (you can decide on how to update based on your requirements).
+    offset += len(id_list)
+
+    return id_list
 
 def generate_dependency_graph(file_list):
     dependencies = {}
@@ -50,41 +60,10 @@ def generate_dependency_graph(file_list):
             print(f"Skipping non-Python file: {file_path}")
     return dependencies
 
-def get_window_size(model):
-    if model == 'gpt3':
-        return 3000
-    elif model == 'gpt4':
-        return 7000
-    else:
-        raise ValueError("Invalid model specified.")
-    
-def check_elapsed_time(remaining_time, suggestions):
-    return remaining_time <= 0 and len(suggestions) > 0
-
-def check_rate_limit(user_request_timestamps, user_requests_hourly, start_time):
-    current_time = datetime.now() 
-    user_request_timestamps = [t for t in user_request_timestamps if current_time - t < timedelta(minutes=1)]
-    user_requests_per_minute = len(user_request_timestamps)
-    if user_requests_per_minute >= 20:
-        wait_time = 60 - (current_time - user_request_timestamps[0]).total_seconds()
-        logger.info(f"Reached maximum requests per minute. Waiting for {wait_time:.2f} seconds...")
-        time.sleep(wait_time)
-
-    user_request_timestamps.append(current_time)
-    user_requests_hourly += 1
-    if user_requests_hourly > 500:
-        logger.warning("Reached maximum requests per hour. Aborting...")
-        return False
-
-    return True
-
-def process_code(embedding, window_size, start_time, suggestions, dependencies_dict, embeddings_dict):
+def process_code(embedding, window_size, suggestions, dependencies_dict, embeddings_dict):
     code_content = embedding['content'].strip().lstrip('\ufeff')
     success = False
     file_path = os.path.normpath(embedding['metadata']['source'])
-
-    # Log the number of requests being made
-    requests_made = 0
 
     # Find dependencies based on the dependency graph
     dependencies = dependencies_dict.get(file_path, [])
@@ -92,7 +71,7 @@ def process_code(embedding, window_size, start_time, suggestions, dependencies_d
     # Combine the code content with its dependencies
     combined_code = code_content
     for dependency in dependencies:
-        dep_embedding = embeddings_dict.get(json.dumps(dependency))
+        dep_embedding = embeddings_dict.get(dependency)
         if dep_embedding:
             combined_code += f"\n\n### {dep_embedding['metadata']} ###\n{dep_embedding['content']}"
 
@@ -102,164 +81,69 @@ def process_code(embedding, window_size, start_time, suggestions, dependencies_d
 
         # Add the windowed_code to the prompt
         prompt = """
-            You are CodeGenie AI, a superintelligent AI that analyzes codebases and provides suggestions to improve or refactor code based on its underlying functionality. You are helpful, friendly, incredibly intelligent, and take pride in reviewing code and ensuring code readability.
-
-            Analyze the code file and its dependencies, and suggest improvements based on code optimization, best practices, and opportunities for refactoring:
-
-            {windowed_code}
-
-            [END OF CODE FILE(S)]
-
-            When providing suggestions, consider the following conditions and respond with 'No improvements to be made.' (AND NOTHING ELSE) if the code matches any of them:
-            1. Configuration files
-            2. Gitignore files
-            3. Language-specific configuration files
-            4. Obvious program-dependent config files
-            5. Files with no obvious improvements
-
-            However, if the code does not meet any of these conditions, provide helpful and friendly suggestions IN natural language to improve the code based on its underlying functionality. 
-            It's really important to only enumerate suggestions at this point rather than code. Your role is to be helpful and friendly, so make sure your suggestions align with the given conditions and are genuinely useful when applicable.
+            You are CodeGenie AI, a superintelligent AI that analyzes codebases ...
+            (the same prompt as before)
         """
-
-        chat = ChatOpenAI(
-            streaming=False,
-            callback_manager=CallbackManager([StreamingStdOutCallbackHandler()]),
-            verbose=True,
-            temperature=0.5,
-            request_timeout=60)
         
-        system_message_prompt = SystemMessagePromptTemplate.from_template(prompt)
-        chat_prompt = ChatPromptTemplate.from_messages([system_message_prompt])
+        input_ids = tokenizer.encode(prompt.format(windowed_code=windowed_code), return_tensors='pt')
+        response = model.generate(input_ids, max_length=1000, do_sample=True, temperature=0.5)
+        response_text = tokenizer.decode(response[0]).strip()
 
-        # TODO - Add in support for api completion when it is released
-        # llm = OpenAI(model_name=model, temperature=0.5, max_tokens=GetMaxTokensForModel(model))
-        # prompt_template = PromptTemplate(input_variables=["windowed_code"], template=prompt)
-        # prompt_template.format(windowed_code=windowed_code)
-
-        chain = LLMChain(llm=chat, prompt=chat_prompt)
-        logger.info(f"Running code analysis on file {embedding['metadata']}...")
-        
-        try:
-            # Check elapsed time again and break the loop if it exceeds 60 seconds and there are enough suggestions
-            # Calculate the remaining time
-            remaining_time = 60 - (time.time() - start_time)
-            if check_elapsed_time(remaining_time, suggestions):
-                logger.warning("Rate limit error: 60 second limit reached. Terminating code analysis.")
-                break
+        # Check if the response does not contain the specific phrase "No improvements to be made" as a substring
+        if "No improvements to be made" not in response_text:
+            similarity_threshold = 0.7
             
-            response = chain.run(windowed_code=windowed_code)
-            response_text = response.strip()
-            # Increment the number of requests made
-            requests_made += 1
+            # Check if there are any suggestions and calculate the Jaccard similarity
+            if suggestions:
+                similarities = [jaccard_similarity(suggestion.suggestion, response_text) for suggestion in suggestions]
+                # log
+                logger.info(f"Similarities: {similarities}")
+                is_duplicate = any(similarity >= similarity_threshold for similarity in similarities)
 
-            # Check if the response does not contain the specific phrase "No improvements to be made" as a substring
-            if "No improvements to be made" not in response_text:
-                similarity_threshold = 0.7
-                
-                # Check if there are any suggestions and calculate the Jaccard similarity
-                if suggestions:
-                    similarities = [jaccard_similarity(suggestion.suggestion, response_text) for suggestion in suggestions]
-                    # log
-                    logger.info(f"Similarities: {similarities}")
-                    is_duplicate = any(similarity >= similarity_threshold for similarity in similarities)
-
-                    if is_duplicate:
-                        logger.info(f"Duplicate suggestion for file {embedding['metadata']}: {response_text}")
-                        success = True
-                else:
-                    is_duplicate = False
-                    
-                # Add a new suggestion if there are no duplicates
-                if not is_duplicate:
-                    s = Suggestion(file=str(embedding['metadata']), suggestion=response_text)
-                    logger.info(f"Adding suggestion for file {embedding['metadata']}: {response_text}")
-                    suggestions.add(s)
-                    logger.info(f"Suggested improvement for file {embedding['metadata']}: {response_text}")
-                
-                success = True  # Set success to True if the response is processed without errors
-
+                if is_duplicate:
+                    logger.info(f"Duplicate suggestion for file {embedding['metadata']}: {response_text}")
+                    success = True
             else:
-                logger.info(f"No improvements to be made for file {embedding['metadata']}")
-                success = True  # Set success to True if the response is processed without errors
-                continue
-        
-        except Exception as e:
-            # Handle error from langchain
-            logger.error(f"Error: {e}")
-            # If the error is a rate limit error, retry the request
-            if "RateLimitError" in str(e):
-                wait_time = 20 * (2 ** retries)
-                # Make sure we haven't reached the 60 second limit
-                remaining_time = 60 - (time.time() - start_time)
-                if check_elapsed_time(remaining_time, suggestions):
-                    logger.warning("Rate limit error: 60 second limit reached. Terminating code analysis.")
-                    break
-                else:
-                    logger.warning(f"Rate limit error: {e}. Retrying in {wait_time} seconds...")
-                    time.sleep(wait_time)
-                    retries += 1
-                    if retries >= 5:  # Break the loop if too many retries
-                        logger.warning("Too many retries. Skipping the current file.")
-                        success = True  # Set success to True to move to the next embedding
+                is_duplicate = False
+                
+            # Add a new suggestion if there are no duplicates
+            if not is_duplicate:
+                s = Suggestion(file=str(embedding['metadata']), suggestion=response_text)
+                logger.info(f"Adding suggestion for file {embedding['metadata']}:{response_text}")
+                suggestions.add(s)
+                logger.info(f"Suggested improvement for file {embedding['metadata']}: {response_text}")
+            
+            success = True  # Set success to True if the response is processed without errors
+
+        else:
+            logger.info(f"No improvements to be made for file {embedding['metadata']}")
+            success = True  # Set success to True if the response is processed without errors
+            continue
 
     # return success and suggestions
-    return success, suggestions, requests_made
+    return success, suggestions
 
-def analyze_and_suggest_improvements(batch_size=100, model='gpt4'):
-    suggestions = set() # Initialize an empty set to store unique suggestions
-    window_size = get_window_size(model)
-
-    # Initialize counters for rate restrictions
-    user_requests_hourly = 0
-    user_request_timestamps = []
-
-    start_time = time.time()
+def analyze_and_suggest_improvements(batch_size=100):
+    suggestions = set()
+    window_size = 2048  # You can adjust this based on your desired token count (the maximum for GPT-Neo 125M is 2048)
 
     logger.info("Started analyzing codebase.")
 
+    # Customize the following loop based on how you want to fetch data (you may fetch ids or vectors from ChromaDB)
     while True:
-        # Calculate the remaining time
-        remaining_time = 60 - (time.time() - start_time)
+        # Obtain the ids from ChromaDB, by modifying the fetch_chroma_db_ids function
+        id_list = fetch_chroma_db_ids(batch_size)
+        embeddings_list = chroma_db.get_by_id(id_list)
 
-        if check_elapsed_time(remaining_time, suggestions):
-            logger.warning("Rate limit error: 60 second limit reached. Terminating code analysis.")
-            break
+        # Create the embeddings_dict from the embeddings_list
+        embeddings_dict = {embedding['metadata']['source']: embedding for embedding in embeddings_list}
 
-        embeddings_query = (
-            supabase
-            .from_(os.environ.get("TABLE_NAME"))
-            .select("metadata,content")
-            .limit(batch_size)
-        )
-
-        result = embeddings_query.execute()
-
-        if len(result.data) == 0:
-            logger.info("No data to fetch.")
-            break
-
-        embeddings_list = result.data
-        embeddings_dict = {json.dumps(embedding['metadata']): embedding for embedding in embeddings_list}
-        file_list = [json.dumps(embedding['metadata']) for embedding in embeddings_list]
-
-        dependencies_dict = generate_dependency_graph(file_list)
+        dependencies_dict = generate_dependency_graph(embeddings_list)
 
         for embedding in embeddings_list:
             success = False  # Add a flag to check if the request was successful
-            while not success:  # Continue processing the current embedding until success or too many retries or rate limit reached or 1 minute elapsed
-                # Check elapsed time again and break the loop if it exceeds 1 minute and there are enough suggestions
-                remaining_time = 60 - (time.time() - start_time)
-                if check_elapsed_time(remaining_time, suggestions):
-                    logger.warning("Rate limit error: 60 second limit reached. Terminating code analysis.")
-                    break
-
-                # Check and enforce user rate restrictions
-                if not check_rate_limit(user_request_timestamps, user_requests_hourly, start_time):
-                    return
-
-                success, new_suggestions, user_requests = process_code(embedding, window_size, start_time, suggestions, dependencies_dict, embeddings_dict)
-                user_requests_hourly += user_requests
-                user_request_timestamps.append(datetime.now()) 
+            while not success:  # Continue processing the current embedding until success
+                success, new_suggestions = process_code(embedding, window_size, suggestions, dependencies_dict, embeddings_dict)
                 if new_suggestions is not None:
                     for suggestion in new_suggestions:
                         # Use the custom Suggestion class to create a hashable object
@@ -268,12 +152,8 @@ def analyze_and_suggest_improvements(batch_size=100, model='gpt4'):
                         suggestions.add(s)
 
         # Log the number of suggestions generated
-
         suggestions_list = [{'file': s.file, 'suggestion': s.suggestion} for s in suggestions]
         print(f"Generated {len(suggestions_list)} suggestions in total.")
-
-        # Log the number of requests made
-        print(f"Made {user_requests_hourly} requests in total.")
 
         implement_suggestions(suggestions_list)
 
@@ -286,7 +166,6 @@ def implement_suggestions(suggestions):
         except ValueError as e:
             print(e)
             continue
-
         try:
             original_code = read_original_code(file_path)
         except (FileNotFoundError, PermissionError) as e:
@@ -317,88 +196,53 @@ def get_file_path_and_dictionary(suggestion):
 
     return relative_file_path, dictionary
 
-    # Split the file key back into the repository URL and relative file path
-    repo_url, relative_file_path = file_key.split('/', 1)
-
-    return relative_file_path, dictionary
-
 def read_original_code(file_path):
     with open(file_path, 'r', encoding='utf-8') as f:
         original_code = f.read()
     return original_code
 
 def apply_suggestion(original_code, suggestion, file_path):
-    # Process the original_code with windowing
-    window_size = get_window_size(model)
-    anchor_map = {}
-    all_refactored_lines = []
+    prompt = """
+        You are CodeGenie AI. You are a superintelligent AI that refactors codebases based on suggestions provided by your counterpart AI to improve underlying functionality.
+        You are:
+        - helpful & friendly
+        - incredibly intelligent
+        - an uber developer who takes pride in writing code
+        Utilize the following suggestion that your counterpart provided and implement them in the snippet we provide you.
+        First you get the suggestion, then you get the current code window.
+        Write code and nothing else, if you are writing anything in natural language then it will only be comments denoted by the appropriate syntax for the language you are writing in.
+        Ultimately your goal is to implement the suggestions provided directly as code, be careful not to delete any code that is not part of the suggestions.
+        Suggestions (in natural language):
+        {suggestion_text}
+        Code:
+        {windowed_code}
+        [END OF CODE FILE(S)]
+    """
 
-    for idx in range(0, len(original_code), window_size):
-        windowed_code = original_code[idx: idx + window_size]
+    # Split the original_code into windows
+    window_size = 2048
+    code_windows = [original_code[i:i + window_size] for i in range(0, len(original_code), window_size)]
 
-        # Add the windowed_code to the prompt
-        prompt= """
-            You are CodeGenie AI. You are a superintelligent AI that refactors codebases based on suggestions provided by your counterpart AI to improve underlying functionality.
-            You are:
-            - helpful & friendly
-            - incredibly intelligent
-            - an uber developer who takes pride in writing code
-            Utilize the following suggestion that your counterpart provided and implement them in the snippet we provide you.
-            First you get the suggestion, then you get the current code window.
-            Write code and nothing else, if you are writing anything in natural language then it will only be comments denoted by the appropriate syntax for the language you are writing in.
-            Ultimately your goal is to implement the suggestions provided directly as code, be careful not to delete any code that is not part of the suggestions.
-            Suggestions (in natural language):
-            {suggestion_text}
-            Code:
-            {windowed_code}
-            [END OF CODE FILE(S)]
-        """
-                     
-        chat = ChatOpenAI(
-            streaming=True,
-            callback_manager=CallbackManager([StreamingStdOutCallbackHandler()]),
-            verbose=True,
-            temperature=0.5,
-            request_timeout=60)
-        system_message_prompt = SystemMessagePromptTemplate.from_template(prompt)
-        chat_prompt = ChatPromptTemplate.from_messages([system_message_prompt])
-        chain = LLMChain(llm=chat, prompt=chat_prompt)
-        logger.info(f"Implementing suggested improvements to code in {file_path}...")
-        try:
-            response = chain.run(suggestion_text=suggestion, windowed_code=windowed_code)
+    # Process each window using GPT-Neo
+    refactored_windows = []
+    for window in code_windows:
+        # Pass suggestion['suggestion'] to suggestion_text instead of the whole dictionary
+        input_ids = tokenizer.encode(prompt.format(suggestion_text=suggestion['suggestion'], windowed_code=window), return_tensors='pt')
+        response = model.generate(input_ids, max_length=1024, do_sample=True, temperature=0.5)
+        refactored_code = tokenizer.decode(response[0]).strip()
+        refactored_windows.append(refactored_code)
 
-            # Get the refactored lines from the response
-            original_lines = windowed_code.splitlines()
-            refactored_lines = response.splitlines()
-            all_refactored_lines.extend(refactored_lines)
+    # Recombine the refactored windows into a single refactored_code
+    refactored_code = "\n".join(refactored_windows)
 
-            # Update the anchor_map with the untouched lines
-            untouched_lines = find_untouched_lines(original_lines, refactored_lines)
+    # Create an anchor map using the original_code and refactored_code
+    anchor_map = create_anchor_map(original_code, refactored_code)
 
-            if not untouched_lines:
-                print("No untouched lines found")
+    # Merge the refactored code with the original_code using the anchor_map
+    merged_code = merge_code(original_code.splitlines(), refactored_code.splitlines(), anchor_map)
 
-            for original_line_number, refactored_line_number in untouched_lines.items():
-                if original_line_number < 0 or refactored_line_number < 0:
-                    print(f"Skipping negative line numbers: original={original_line_number}, refactored={refactored_line_number}")
-                    continue
-
-                max_line_number = max(len(original_lines), len(refactored_lines))
-                if original_line_number >= max_line_number or refactored_line_number >= max_line_number:
-                    print(f"Skipping out-of-range line numbers: original={original_line_number}, refactored={refactored_line_number}")
-                    continue
-
-                anchor_map[idx + original_line_number] = idx + refactored_line_number
-            
-            # Merge the refactored code with the original code using the anchor_map
-            merged_code = merge_code(original_code.splitlines(), all_refactored_lines, anchor_map)
-            
-            # Save the new file content to the file
-            with open(file_path, 'w') as f:
-                f.write(merged_code)
-        except Exception as e:
-            logger.error(f"Error: {e}")
-            continue
+    with open(file_path, "w") as f:
+        f.write(merged_code)
 
 def preprocess_lines(lines):
     pattern = re.compile(r"^\s*(#.*|\s*)$")
@@ -430,6 +274,11 @@ def find_untouched_lines(original_lines, refactored_lines):
                 untouched_lines[original_index + i] = refactored_index + i
 
     return untouched_lines
+
+def create_anchor_map(original_code, refactored_code):
+    untouched_lines = find_untouched_lines(original_code, refactored_code)
+    anchors = {original_idx: refactored_idx for original_idx, refactored_idx in untouched_lines.items()}
+    return anchors
 
 def merge_code(original_lines, refactored_lines, anchor_map):
     merged_lines = []
@@ -463,34 +312,6 @@ def write_suggestions_to_file(suggestions):
             file_path = suggestion['file']
             suggestion_text = suggestion['suggestion']
             f.write(f"File: {file_path}\n\n{suggestion_text}\n\n\n")
-
-def parse_code_changes(original_code, refactored_code):
-    changes = []
-
-    # Split the code into lines
-    original_lines = original_code.splitlines()
-    refactored_lines = refactored_code.splitlines()
-
-    # Compare the lines using difflib
-    diff = list(difflib.ndiff(original_lines, refactored_lines))
-
-    # Iterate through the diff and identify changes
-    for index, line in enumerate(diff):
-        # If the line starts with a '+', it has been added
-        if line.startswith('+'):
-            if index > 0 and diff[index - 1].startswith('-'):
-                changes.append({
-                    'action': 'modify',
-                    'old_line': diff[index - 1][2:],
-                    'new_line': line[2:]
-                })
-            else:
-                changes.append({'action': 'add', 'line': line[2:]})
-        # If the line starts with a '-', it has been removed
-        elif line.startswith('-') and (index == len(diff) - 1 or not diff[index + 1].startswith('+')):
-            changes.append({'action': 'remove', 'line': line[2:]})
-
-    return changes
 
 def apply_code_changes(original_code, code_changes):
     code_lines = original_code.splitlines()
